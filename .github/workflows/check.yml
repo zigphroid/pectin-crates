@@ -1,0 +1,42 @@
+# The store's check on a pull request: tools/storecheck.py reads the PR's
+# crates (as zips; nothing in them runs) against the store as it is, and
+# comments what each crate holds and anything that's wrong. It runs the
+# store's own copy of storecheck.py, never the PR's, so a PR can't change
+# what checks it (pull_request_target, with the PR's tree checked out as
+# data only).
+name: check
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: read
+  pull-requests: write
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: The store as it is
+        uses: actions/checkout@v4
+        with:
+          path: base
+          persist-credentials: false
+      - name: The PR's tree, as data
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: pr
+          persist-credentials: false
+      - name: Check
+        id: check
+        run: |
+          set +e
+          python3 -I base/tools/storecheck.py --old base --new pr --report report.md
+          echo "status=$?" >> "$GITHUB_OUTPUT"
+      - name: Comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh pr comment ${{ github.event.pull_request.number }} --repo ${{ github.repository }} --body-file report.md
+      - name: Fail on a problem
+        if: steps.check.outputs.status != '0'
+        run: exit 1
