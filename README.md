@@ -45,10 +45,11 @@ The check comments with the crate's manifest and files. It refuses a
 crate that:
 - isn't named as its file;
 - owns a file another crate owns;
+- seeds settings other than its own (`RECIPES\NAME.*` or `RECIPES\NAME\`);
 - needs a crate that isn't in the store;
 - doesn't go up in version;
 - has no row in `SOURCES.md`;
 
-and a pull request that changes anything besides `crates/` and
-`SOURCES.md`. Once it's reviewed and merged, the next publish puts the
+and a pull request that removes a crate, or changes anything besides
+`crates/` and `SOURCES.md`. Once it's reviewed and merged, the next publish puts the
 crate in the index.

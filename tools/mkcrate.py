@@ -8,9 +8,9 @@
     tools/mkcrate.py install (--jarcard JARCARD --card CARD.IMG | --dir DIR) [--api N] CRATE.CRT ...
     tools/mkcrate.py show CRATE.CRT
     tools/mkcrate.py sources -o OUT NAME URL PUB  GROCER's SOURCES.TXT seed
-    tools/mkcrate.py index -o DIR CRATE.CRT ...  INDEX.TXT for crates beside it
+    tools/mkcrate.py index -o DIR --source URL CRATE.CRT ...  INDEX.TXT for crates beside it
     tools/mkcrate.py publish --store DIR --crtsign BIN --key KEY --pub PUB
-                             --repo URL --commit C CRATE.CRT ...
+                             --repo URL --commit C --url URL CRATE.CRT ...
 
 A crate is a zip (.CRT) whose paths are relative to J:\\: the program's
 .JAM in JAMS\\, what it ships in LARDER\\, settings files it seeds in
@@ -157,8 +157,21 @@ def check_manifest(m):
             if dep == m["NAME"]:
                 raise CrateError("%s %s itself" % (m["NAME"], key))
     for s in m["SEED"]:
-        if card_path(s).split("\\")[0].upper() != "RECIPES":
-            raise CrateError("%s: SEED %s is not in RECIPES" % (m["NAME"], s))
+        if not seed_ok(m["NAME"], s):
+            raise CrateError("%s: SEED %s isn't its own settings (RECIPES\\%s.* or RECIPES\\%s\\)"
+                             % (m["NAME"], s, m["NAME"], m["NAME"]))
+
+
+def seed_ok(name, path):
+    """A crate seeds only its own settings, RECIPES\\NAME.* or a file in
+    RECIPES\\NAME\\, so no crate can choose another program's (where
+    FUNNEL sends a password, GROCER's sources): grocer's crate.c seed_ok."""
+    parts = card_path(path).upper().split("\\")
+    if len(parts) < 2 or parts[0] != "RECIPES":
+        return False
+    if len(parts) > 2:
+        return parts[1] == name
+    return parts[1].split(".", 1)[0] == name and "." in parts[1]
 
 
 # ---- .JAM headers (sdk/pectin_abi.h, struct jam_header) ----
@@ -611,9 +624,14 @@ def sha256_hex(data):
     return hashlib.sha256(data).hexdigest()
 
 
-def format_index(entries):
-    """INDEX.TXT for [(path below the source, crate bytes)]: a block a
-    crate, by name, CR LF lines."""
+def format_index(entries, serial, source):
+    """INDEX.TXT for [(path below the source, crate bytes)]: a head, then a
+    block a crate, by name, CR LF lines. The head's SERIAL only goes up
+    from one publish to the next, so GROCER FRESH can refuse an older
+    index replayed; SOURCE is the URL it's published at, so an index
+    signed for one source is refused at another (store.c's fresh_one)."""
+    if not (0 < serial <= 0xffffffff):
+        raise CrateError("SERIAL %r: 1 to 4294967295" % serial)
     blocks = []
     for path, data in sorted(entries, key=lambda e: read_crate_bytes(e[1], e[0])[0]["NAME"]):
         m = read_crate_bytes(data, path)[0]
@@ -629,8 +647,30 @@ def format_index(entries):
         lines += ["%-8s %s" % ("CRATE", path), "%-8s %d" % ("BYTES", len(data)),
                   "%-8s %s" % ("SHA256", sha256_hex(data))]
         blocks.append("".join(line + "\r\n" for line in lines))
-    head = "; PectinOS's crates: GROCER FRESH reads this, and checks INDEX.SIG signs it.\r\n"
+    head = ("; PectinOS's crates: GROCER FRESH reads this, and checks INDEX.SIG signs it.\r\n"
+            "%-8s %d\r\n%-8s %s\r\n" % ("SERIAL", serial, "SOURCE", source))
     return head + "".join("\r\n" + b for b in blocks)
+
+
+def index_head(text):
+    """{key: value} of the lines before the first NAME: SERIAL and SOURCE."""
+    head = {}
+    for line in text.replace("\r\n", "\n").split("\n"):
+        line = line.strip()
+        if not line or line[0] in ";#":
+            continue
+        parts = line.split(None, 1)
+        if parts[0] == "NAME":
+            break
+        head[parts[0]] = parts[1] if len(parts) > 1 else ""
+    return head
+
+
+def next_serial(old_text, now=None):
+    """The SERIAL a new index takes: the time, or one past the old one's."""
+    import time
+    old = index_head(old_text).get("SERIAL", "0") if old_text else "0"
+    return max(int(now if now is not None else time.time()), int(old) + 1 if old.isdigit() else 1)
 
 
 def parse_index(text):
@@ -647,7 +687,7 @@ def parse_index(text):
                 raise CrateError("index line %d: a second %s" % (n, value))
             cur = out[value] = {"NAME": value, "NEEDS": [], "WANTS": []}
         elif cur is None:
-            raise CrateError("index line %d: before the first NAME" % n)
+            continue                    # the head: index_head reads it
         elif key in ("NEEDS", "WANTS"):
             cur[key] += value.split()
         else:
@@ -703,12 +743,15 @@ def store_crates(store):
     return out
 
 
-def publish(store, crates, source, crtsign, key, pub, say=print):
+def publish(store, crates, source, crtsign, key, pub, url, say=print):
     """Our built crates into the store, each changed one with a version
     after the store's, then the index made from every crate there and
     signed. Returns the names that changed. The store's tree is checked
     first (tools/storecheck.py), and the signature against pub."""
     import storecheck
+    problems = storecheck.check_tree(store)     # before ours go in: nothing left behind
+    if problems:
+        raise CrateError("the store: " + "; ".join(problems))
     have = store_crates(store)
     rows = read_sources_md(os.path.join(store, SOURCES_MD))
     changed = []
@@ -736,8 +779,9 @@ def publish(store, crates, source, crtsign, key, pub, say=print):
         raise CrateError("the store: " + "; ".join(problems))
     entries = [("%s/%s.CRT" % (STORE_CRATES, n), d) for n, d in store_crates(store).items()]
     index = os.path.join(store, INDEX)
+    old = open(index).read() if os.path.exists(index) else ""
     with open(index, "wb") as f:
-        f.write(format_index(entries).encode("ascii"))
+        f.write(format_index(entries, next_serial(old), url).encode("ascii"))
     sig = os.path.join(store, INDEX_SIG)
     new = sig + ".new"
     for args in (["sign", key, index, new], ["verify", pub, index, new]):
@@ -800,6 +844,7 @@ def main(argv=None):
     so.add_argument("pub")
     ix = sub.add_parser("index")
     ix.add_argument("-o", "--output", required=True, help="the directory the crates are served from")
+    ix.add_argument("--source", required=True, help="the URL the directory is served at")
     ix.add_argument("crates", nargs="+")
     pu = sub.add_parser("publish")
     pu.add_argument("--store", required=True)
@@ -808,6 +853,7 @@ def main(argv=None):
     pu.add_argument("--pub", required=True)
     pu.add_argument("--repo", required=True)
     pu.add_argument("--commit", required=True)
+    pu.add_argument("--url", required=True, help="the URL the store is read at")
     pu.add_argument("crates", nargs="+")
     args = ap.parse_args(argv)
     try:
@@ -833,10 +879,13 @@ def main(argv=None):
             for path in args.crates:
                 with open(path, "rb") as f:
                     entries.append((os.path.relpath(path, args.output).replace(os.sep, "/"), f.read()))
-            with open(os.path.join(args.output, INDEX), "wb") as f:
-                f.write(format_index(entries).encode("ascii"))
+            index = os.path.join(args.output, INDEX)
+            old = open(index).read() if os.path.exists(index) else ""
+            with open(index, "wb") as f:
+                f.write(format_index(entries, next_serial(old), args.source).encode("ascii"))
         elif args.cmd == "publish":
-            publish(args.store, args.crates, (args.repo, args.commit), args.crtsign, args.key, args.pub)
+            publish(args.store, args.crates, (args.repo, args.commit), args.crtsign, args.key, args.pub,
+                    args.url)
         elif args.cmd == "install":
             if bool(args.dir) == bool(args.card and args.jarcard):
                 raise CrateError("install takes --dir, or --jarcard and --card")

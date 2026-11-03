@@ -8,9 +8,11 @@
 The store (zigphroid/pectin-crates) is crates/NAME.CRT, SOURCES.md
 (each crate's source repo and commit) and INDEX.TXT/INDEX.SIG, which
 only Jacob's `make publish` writes. A tree is sound when every crate
-reads, is named as its file, owns no file another crate owns, needs
-only crates the store has, and has a SOURCES.md row. A pull request also
-changes nothing but crates/ and SOURCES.md, and a crate it changes goes
+reads, is named as its file, owns no file another crate owns, seeds
+only its own settings (RECIPES\\NAME.*, RECIPES\\NAME\\: mkcrate's
+seed_ok, so no two crates seed one file), needs only crates the store
+has, and has a SOURCES.md row. A pull request also changes nothing but
+crates/ and SOURCES.md, removes no crate, and a crate it changes goes
 up in version. --report writes what the PR brings, each crate's
 manifest and files, as Markdown for the PR's comment. Nothing in a
 crate is run: they are read as zips.
@@ -110,6 +112,8 @@ def check_pr(old, new):
                 problems.append("%s: version %s isn't after the store's %s" % (name, v1, v0))
     for name in sorted(set(was) - set(now)):
         changed.append(name)
+        problems.append("%s: a PR doesn't remove a crate (the store's owner does, in a publish)"
+                        % name)
     return problems, changed
 
 
