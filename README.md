@@ -31,15 +31,17 @@ computer. So nothing reaches a card until it has been read and published.
 
 ## Sending a crate
 
-1. Build it. In a program's own repository (`make new-app` makes one),
-   `tools/mkcrate.py build` makes `NAME.CRT` from the `.JAM` and its
-   files; the same files make the same bytes.
-2. Fork this repository and add `crates/NAME.CRT`, or replace it with a
-   later version: the version must go up.
-3. Add a row to `SOURCES.md`: the crate's name, the public repository it
-   was built from, and the commit. Anyone can then read the source and
-   build the same crate.
-4. Open a pull request that changes only `crates/` and `SOURCES.md`.
+1. In your program's own repository (`make new-app` makes one), `make
+   preflight` builds `build/NAME.CRT` and checks it as the store will:
+   against this store's index, the card paths in your source, the page,
+   the settings, the API and size, that the commit is pushed and public,
+   and for secrets.
+2. `make submit` forks this repository, puts `crates/NAME.CRT` and your
+   `SOURCES.md` row (your repository and the full commit) on a branch,
+   and opens the pull request with the report as its text. The version
+   must go up from the store's.
+3. The check below runs on the pull request. It changes only `crates/`
+   and `SOURCES.md`.
 
 The check comments with the crate's manifest and files. It refuses a
 crate that:
