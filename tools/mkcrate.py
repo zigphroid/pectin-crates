@@ -53,6 +53,9 @@ GROCER_JAR = "KEEP\\GROCER"
 NAME_RE = re.compile(r"^[A-Z0-9_]{1,8}$")
 VERSION_RE = re.compile(r"^[0-9A-Za-z.+-]{1,15}$")
 WHAT_MAX = 72
+DEPS_MAX = 64                           # crate.h's CRATE_DEPS_MAX: names in NEEDS, in WANTS
+NAMES_A_LINE = 16                       # crate.c's: a long NEEDS goes over several lines
+API_MAX = 1000000                # GROCER's CRATE_API_MAX
 KEYS = ("NAME", "VERSION", "WHAT", "API", "NEEDS", "WANTS", "SEED")
 ZIP_DATE = (1980, 1, 1, 0, 0, 0)        # the earliest a zip can say: no build time in the bytes
 # A crate owns files in these jars only: KEEP is what programs write and
@@ -74,6 +77,8 @@ def card_path(path):
     parts = p.split("\\")
     if ":" in p or not p or any(part in ("", ".", "..") for part in parts):
         raise CrateError("%r is not a path inside the jar" % path)
+    if any(part[-1] in ". " for part in parts):
+        raise CrateError("%r has a name FAT can't hold (it ends in a dot or a space)" % path)
     if any(c in p for c in '*?"<>|') or any(ord(c) < 32 for c in p):
         raise CrateError("%r has a character FAT can't hold" % path)
     return p
@@ -84,8 +89,24 @@ def path_key(path):
     return card_path(path).upper()
 
 
-def check_owned(path):
+# An 8.3 alias's spelling: a name ending ~N (before any extension), as
+# FAT makes for a long name (MARMAL~1.TXT). A crate can't own one: on the
+# card it may be another crate's long-named file under its other name, and
+# two records would own one file (#1648).
+ALIAS_RE = re.compile(r"~[0-9]+(\.[^.\\]*)?$")
+
+
+def check_no_alias(path):
     p = card_path(path)
+    for part in p.split("\\"):
+        if ALIAS_RE.search(part):
+            raise CrateError("%s: %s is spelled as an 8.3 alias (~N); give the file its own name"
+                             % (p, part))
+    return p
+
+
+def check_owned(path):
+    p = check_no_alias(path)
     top = p.split("\\")[0].upper()
     if top not in OWNED_TOP:
         raise CrateError("%s: a crate's files go in JAMS or LARDER (or RECIPES as a SEED)" % p)
@@ -103,8 +124,9 @@ def format_manifest(m):
     if m.get("API"):
         lines.append("%-8s %d" % ("API", m["API"]))
     for key in ("NEEDS", "WANTS"):
-        if m.get(key):
-            lines.append("%-8s %s" % (key, " ".join(m[key])))
+        names = m.get(key, [])
+        for i in range(0, len(names), NAMES_A_LINE):
+            lines.append("%-8s %s" % (key, " ".join(names[i:i + NAMES_A_LINE])))
     for s in m.get("SEED", []):
         lines.append("%-8s %s" % ("SEED", s))
     return "".join(line + "\r\n" for line in lines)
@@ -143,6 +165,9 @@ def check_manifest(m):
     if not VERSION_RE.match(m.get("VERSION", "")):
         raise CrateError("%s: VERSION %r: 1 to 15 of 0-9, A-Z, a-z, '.', '+', '-'"
                          % (m["NAME"], m.get("VERSION")))
+    if not m.get("WHAT", "").isascii():      # the manifest is ASCII; PectinOS's UTF-8 is not
+        raise CrateError("%s: WHAT is ASCII only (an em dash or an accent in the page's title?)"
+                         % m["NAME"])
     if len(m.get("WHAT", "")) > WHAT_MAX:
         raise CrateError("%s: WHAT is over %d characters" % (m["NAME"], WHAT_MAX))
     api = m.setdefault("API", 0)
@@ -150,7 +175,11 @@ def check_manifest(m):
         if not api.isdigit():
             raise CrateError("%s: API %r is not a number" % (m["NAME"], api))
         m["API"] = int(api)
+    if not 0 <= m["API"] <= API_MAX:
+        raise CrateError("%s: API %r is over %d" % (m["NAME"], m["API"], API_MAX))
     for key in ("NEEDS", "WANTS"):
+        if len(m[key]) > DEPS_MAX:
+            raise CrateError("%s: over %d names in %s" % (m["NAME"], DEPS_MAX, key))
         for dep in m[key]:
             if not NAME_RE.match(dep):
                 raise CrateError("%s: %s %r is not a crate's name" % (m["NAME"], key, dep))
@@ -166,7 +195,7 @@ def seed_ok(name, path):
     """A crate seeds only its own settings, RECIPES\\NAME.* or a file in
     RECIPES\\NAME\\, so no crate can choose another program's (where
     FUNNEL sends a password, GROCER's sources): grocer's crate.c seed_ok."""
-    parts = card_path(path).upper().split("\\")
+    parts = check_no_alias(path).upper().split("\\")
     if len(parts) < 2 or parts[0] != "RECIPES":
         return False
     if len(parts) > 2:
@@ -275,10 +304,18 @@ def make_crate(manifest, files, seeds=()):
     return out.getvalue()
 
 
+# A member the zip says is bigger than this, or members that add up to more,
+# are refused before anything is inflated: someone else's crate may be a
+# zip bomb (#1740). A card is a few GB, a program's file at most a few MB.
+MEMBER_MAX = 16 * 1024 * 1024
+CRATE_MAX = 64 * 1024 * 1024
+
+
 def read_crate(path, what=None):
     """(manifest, {card path: bytes} of owned files, {card path: bytes} of
     seeds), checked as install would. path may be a file object, what
-    its name in messages."""
+    its name in messages. Whatever is wrong with the zip (not ASCII, a bad
+    CRC, a member too big) is a CrateError, never another exception."""
     what = what or path
     try:
         z = zipfile.ZipFile(path)
@@ -288,7 +325,29 @@ def read_crate(path, what=None):
         names = z.namelist()
         if MANIFEST not in names:
             raise CrateError("%s: no %s" % (what, MANIFEST))
-        m = parse_manifest(z.read(MANIFEST).decode("ascii"))
+        if any(i.file_size > MEMBER_MAX for i in z.infolist()) or \
+                sum(i.file_size for i in z.infolist()) > CRATE_MAX:
+            raise CrateError("%s: too big (a file over %d MB, or %d MB in all)"
+                             % (what, MEMBER_MAX >> 20, CRATE_MAX >> 20))
+
+        # sdk/lib/zip.c reads stored and deflated members only, and no
+        # password: anything else would pass here and fail on the board.
+        for i in z.infolist():
+            if i.compress_type not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED):
+                raise CrateError("%s: %s is compressed a way SHUCK can't read (stored or deflated only)"
+                                 % (what, i.filename))
+            if i.flag_bits & 1:
+                raise CrateError("%s: %s is encrypted" % (what, i.filename))
+
+        def read(name):
+            try:
+                return z.read(name)
+            except (zipfile.BadZipFile, zlib.error, EOFError, NotImplementedError, OSError, RuntimeError) as e:
+                raise CrateError("%s: %s doesn't read (%s)" % (what, name, e))
+        try:
+            m = parse_manifest(read(MANIFEST).decode("ascii"))
+        except UnicodeDecodeError:
+            raise CrateError("%s: %s isn't ASCII" % (what, MANIFEST))
         seeds = {path_key(s) for s in m["SEED"]}
         owned, seeded = {}, {}
         for name in names:
@@ -296,10 +355,10 @@ def read_crate(path, what=None):
                 continue
             p = card_path(name)
             if path_key(p) in seeds:
-                seeded[p] = z.read(name)
+                seeded[p] = read(name)
             else:
                 check_owned(p)
-                owned[p] = z.read(name)
+                owned[p] = read(name)
         missing = seeds - {path_key(p) for p in seeded}
         if missing:
             raise CrateError("%s: SEED %s is not in the crate" % (what, sorted(missing)[0]))
@@ -454,11 +513,15 @@ class DirCard:
         return {n.upper() for n in os.listdir(host)}
 
     def has(self, path):
-        host = self._find(path)
-        return host is not None and os.path.isfile(host)
+        # A jar counts, as on Card: a crate's file there is refused, not an
+        # IsADirectoryError from the write (#1938).
+        return self._find(path) is not None
 
     def get(self, path):
-        with open(self._find(path), "rb") as f:
+        host = self._find(path)
+        if host is not None and os.path.isdir(host):
+            raise CrateError("%s is a jar, not a file" % path)
+        with open(host, "rb") as f:
             return f.read()
 
     def records(self):
@@ -473,7 +536,7 @@ class DirCard:
     def write(self, puts, removes):
         for p in removes:
             host = self._find(p)
-            if host is not None:
+            if host is not None and not os.path.isdir(host):    # a jar now: not ours to take
                 os.remove(host)
         for path, data in puts:
             with open(self._find(path, make=True), "wb") as f:
@@ -506,28 +569,62 @@ def plan_order(crates):
 def install(card, paths, api, say=print, source="PC"):
     """Put the crates at paths on card, upgrading ones already there. Refuses
     (before writing anything for that crate) a NEEDS that's missing, a
-    newer API than api, or a file another crate owns."""
+    newer API than api, a file another crate owns, or a file of the
+    person's own (no crate owns it) at one of its paths, unless its bytes
+    are the crate's already (#1698)."""
     recs = card.records()
     crates = plan_order([read_crate(p) for p in paths])
-    for m, owned, seeds in crates:
+    # A file may move from one crate of the batch to another, whichever way
+    # the upgrades happen to be ordered (#1648): the batch's own old records
+    # don't clash with its new manifests, which are checked against each
+    # other instead, and an upgrade doesn't remove a file another crate of
+    # the batch now owns.
+    batch = {m["NAME"] for m, _, _ in crates}
+    new_owner = {}
+    for m, owned, _ in crates:
+        for p in owned:
+            other = new_owner.setdefault(path_key(p), m["NAME"])
+            if other != m["NAME"]:
+                raise CrateError("%s: %s belongs to %s" % (m["NAME"], p, other))
+    was_batch = {path_key(p) for n in batch if n in recs for p in recs[n][1]}
+    # Every crate's API and NEEDS before anything is written, so a later
+    # crate's refusal doesn't leave the earlier ones of the batch in, with a
+    # file that moved between them in two records (#1995). plan_order puts
+    # a crate the batch needs before the one needing it.
+    for m, _, _ in crates:
         name = m["NAME"]
         if m["API"] > api:
             raise CrateError("%s needs API %d; this kernel has %d" % (name, m["API"], api))
         for dep in m["NEEDS"]:
-            if dep not in recs:
+            if dep not in recs and dep not in batch:
                 raise CrateError("%s needs %s, which isn't installed or in this install" % (name, dep))
+    for m, owned, seeds in crates:
+        name = m["NAME"]
         mine = {path_key(p) for p in owned}
         for other, (_, theirs, _) in recs.items():
-            if other == name:
+            if other in batch:
                 continue
             clash = mine & {path_key(p) for p in theirs}
             if clash:
                 raise CrateError("%s: %s belongs to %s" % (name, sorted(clash)[0], other))
         old = recs.get(name)
+        # A file of the person's own at a crate's path stays theirs (#1698),
+        # unless its bytes are the crate's already (a cut install's leftovers).
+        had = {path_key(p) for p in old[1]} | was_batch if old else was_batch
+        for p, data in sorted(owned.items()):
+            if path_key(p) in had or not card.has(p):
+                continue
+            try:
+                same = card.get(p) == data
+            except CrateError:
+                same = False
+            if not same:
+                raise CrateError("%s: %s is already there and isn't this crate's (move it aside, "
+                                 "then install again)" % (name, p))
         gone = []
         seeded = {}
         if old:
-            gone = [p for p in old[1] if path_key(p) not in mine and card.has(p)]
+            gone = [p for p in old[1] if path_key(p) not in new_owner and card.has(p)]
             seeded = {p: old[2][p] for p in old[2]}
         puts = sorted(owned.items(), key=lambda e: e[0].upper())
         new_seeded = {}
@@ -550,7 +647,11 @@ def install(card, paths, api, say=print, source="PC"):
         # GROCER CHECK reports and a second ADD finishes (DESIGN §8).
         card.write([(GROCER_JAR + "\\" + name + ".LST", record.encode("ascii"))], [])
         recs[name] = (m, {p: (crc32(d), len(d)) for p, d in owned.items()}, new_seeded)
-        say("%s %s %s: %d files%s" % ("upgraded" if old else "installed", name, m["VERSION"],
+        # Equal by number (1.00 over 1.0) is a reinstall, as GROCER says (#1912).
+        say("%s %s %s: %d files%s" % (("reinstalled" if version_key(old[0]["VERSION"]) ==
+                                       version_key(m["VERSION"]) else
+                                       "upgraded" if newer(m["VERSION"], old[0]["VERSION"]) else
+                                       "downgraded") if old else "installed", name, m["VERSION"],
                                       len(owned), ", %d seeded" % len(new_seeded) if new_seeded else ""))
     # A want is said, not enforced: the program runs without it. Said once
     # the whole install is in, so a want in the same install counts.
@@ -702,6 +803,18 @@ def format_sources(lines):
     return "".join(s + "\r\n" for s in head + ["%s %s %s" % s for s in lines])
 
 
+def read_text(path):
+    """A file's text, closed after (an open(...).read() left it to the
+    garbage collector, and test-py printed a ResourceWarning for each)."""
+    with open(path) as f:
+        return f.read()
+
+
+def read_bytes(path):
+    with open(path, "rb") as f:
+        return f.read()
+
+
 def read_key_hex(path, n=32):
     with open(path) as f:
         text = f.read().strip()
@@ -747,11 +860,32 @@ def publish(store, crates, source, crtsign, key, pub, url, say=print):
     """Our built crates into the store, each changed one with a version
     after the store's, then the index made from every crate there and
     signed. Returns the names that changed. The store's tree is checked
-    first (tools/storecheck.py), and the signature against pub."""
+    first (tools/storecheck.py), and again with our crates in, and the
+    signature against pub. All of it happens in a copy of the tree: the
+    store's own is written only when every check and the signing have
+    passed, so a refused publish leaves nothing behind (#1740)."""
+    import shutil
     import storecheck
-    problems = storecheck.check_tree(store)     # before ours go in: nothing left behind
+    problems = storecheck.check_tree(store)
     if problems:
         raise CrateError("the store: " + "; ".join(problems))
+    with tempfile.TemporaryDirectory() as tmp:
+        work = os.path.join(tmp, "store")
+        shutil.copytree(store, work, ignore=shutil.ignore_patterns(".git"))
+        changed = _publish_into(work, crates, source, crtsign, key, pub, url, say)
+        # Only what publish writes goes back: crates/ (the changed ones),
+        # SOURCES.md, the index and its signature, and the PR check's copies.
+        os.makedirs(os.path.join(store, STORE_CRATES), exist_ok=True)
+        os.makedirs(os.path.join(store, "tools"), exist_ok=True)
+        back = ["%s/%s.CRT" % (STORE_CRATES, n) for n in changed]
+        back += [SOURCES_MD, INDEX, INDEX_SIG, "tools/mkcrate.py", "tools/storecheck.py"]
+        for rel in back:
+            shutil.copyfile(os.path.join(work, rel), os.path.join(store, rel))
+    return changed
+
+
+def _publish_into(store, crates, source, crtsign, key, pub, url, say):
+    import storecheck
     have = store_crates(store)
     rows = read_sources_md(os.path.join(store, SOURCES_MD))
     changed = []
@@ -779,7 +913,7 @@ def publish(store, crates, source, crtsign, key, pub, url, say=print):
         raise CrateError("the store: " + "; ".join(problems))
     entries = [("%s/%s.CRT" % (STORE_CRATES, n), d) for n, d in store_crates(store).items()]
     index = os.path.join(store, INDEX)
-    old = open(index).read() if os.path.exists(index) else ""
+    old = read_text(index) if os.path.exists(index) else ""
     with open(index, "wb") as f:
         f.write(format_index(entries, next_serial(old), url).encode("ascii"))
     sig = os.path.join(store, INDEX_SIG)
@@ -880,7 +1014,7 @@ def main(argv=None):
                 with open(path, "rb") as f:
                     entries.append((os.path.relpath(path, args.output).replace(os.sep, "/"), f.read()))
             index = os.path.join(args.output, INDEX)
-            old = open(index).read() if os.path.exists(index) else ""
+            old = read_text(index) if os.path.exists(index) else ""
             with open(index, "wb") as f:
                 f.write(format_index(entries, next_serial(old), args.source).encode("ascii"))
         elif args.cmd == "publish":
