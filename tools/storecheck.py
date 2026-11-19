@@ -36,8 +36,14 @@ def load(tree):
     """{NAME: (bytes, manifest, owned, seeds)} and the problems reading them."""
     crates, problems = {}, []
     jar = os.path.join(tree, mkcrate.STORE_CRATES)
+    if os.path.islink(jar):
+        return crates, ["%s: a link, not a directory" % mkcrate.STORE_CRATES]
     for n in sorted(os.listdir(jar)) if os.path.isdir(jar) else []:
         path = os.path.join(jar, n)
+        if os.path.islink(path):
+            # A PR's symlink would be followed to a file outside the tree (#1740).
+            problems.append("%s/%s: a link; crates are files" % (mkcrate.STORE_CRATES, n))
+            continue
         if not n.endswith(".CRT") or not os.path.isfile(path):
             problems.append("%s/%s: crates/ holds NAME.CRT files only" % (mkcrate.STORE_CRATES, n))
             continue
@@ -70,6 +76,9 @@ def check_tree(tree):
         for dep in m["NEEDS"]:
             if dep not in crates:
                 problems.append("%s needs %s, which isn't in the store" % (name, dep))
+    if os.path.islink(os.path.join(tree, mkcrate.SOURCES_MD)):
+        problems.append("%s: a link; it is a file" % mkcrate.SOURCES_MD)
+        return problems
     rows = mkcrate.read_sources_md(os.path.join(tree, mkcrate.SOURCES_MD))
     for name in sorted(crates):
         if name not in rows:
@@ -79,22 +88,32 @@ def check_tree(tree):
     return problems
 
 
-def files(tree):
-    """{relative path: bytes} of the tree, .git left out."""
+def files(tree, running=False):
+    """{relative path: bytes} of the tree, .git left out, and with running
+    (the store's own tree, whose tools/ this check runs from) the
+    __pycache__ its Python writes there too, which isn't a change the PR
+    made. A PR's own __pycache__ still counts. A link is its
+    target's path, not its bytes (os.walk doesn't follow a link to a
+    directory, and a link to a file must not be read: it may point out of
+    the tree), so a PR that adds one changes the tree and check_tree names it."""
     out = {}
     for here, dirs, names in os.walk(tree):
-        dirs[:] = [d for d in dirs if d != ".git"]
-        for n in names:
+        dirs[:] = [d for d in dirs if d != ".git" and not (running and d == "__pycache__")]
+        for n in names + [d for d in dirs if os.path.islink(os.path.join(here, d))]:
             p = os.path.join(here, n)
+            rel = os.path.relpath(p, tree).replace(os.sep, "/")
+            if os.path.islink(p):
+                out[rel] = b"link:" + os.fsencode(os.readlink(p))
+                continue
             with open(p, "rb") as f:
-                out[os.path.relpath(p, tree).replace(os.sep, "/")] = f.read()
+                out[rel] = f.read()
     return out
 
 
 def check_pr(old, new):
     """(problems, the changed crates' names) for a PR taking old's tree to new's."""
     problems = check_tree(new)
-    a, b = files(old), files(new)
+    a, b = files(old, running=True), files(new)
     for p in sorted(set(a) | set(b)):
         if a.get(p) != b.get(p) and not p.startswith(PR_PATHS[0]) and p != PR_PATHS[1]:
             problems.append("%s: a PR changes only crates/ and %s (the rest is publish's)"
@@ -122,6 +141,7 @@ def report(old, new, problems, changed):
     was, _ = load(old)
     now, _ = load(new)
     rows = mkcrate.read_sources_md(os.path.join(new, mkcrate.SOURCES_MD))
+    old_rows = mkcrate.read_sources_md(os.path.join(old, mkcrate.SOURCES_MD))
     out = ["## Store check", ""]
     if problems:
         out += ["**%d problem%s:**" % (len(problems), "" if len(problems) == 1 else "s"), ""]
@@ -137,6 +157,9 @@ def report(old, new, problems, changed):
         out += ["### %s %s (%s)" % (name, m["VERSION"], verb), ""]
         if name in rows:
             out += ["Source: %s at `%s`" % rows[name], ""]
+            if name in was and name in old_rows and old_rows[name][0] != rows[name][0]:
+                out += ["**Source moved from %s to %s**: this replaces the crate of another repo." %
+                        (old_rows[name][0], rows[name][0]), ""]
         out += ["```", mkcrate.format_manifest(m).replace("\r\n", "\n").rstrip(), "```", ""]
         out += ["| Bytes | File |", "|---:|---|"]
         out += ["| %d | `%s` |" % (len(owned[p]), p) for p in sorted(owned, key=str.upper)]
